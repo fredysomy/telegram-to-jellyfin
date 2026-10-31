@@ -1,0 +1,74 @@
+name: telegram-downloader
+
+services:
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: bot-api.Dockerfile
+      args:
+        TELEGRAM_BOT_API_COMMIT: e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1
+    image: telegram-downloader/bot-api:e3e9dd8
+    restart: unless-stopped
+    user: "1000:1000"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: |
+      set -a
+      . /run/secrets/telegram
+      set +a
+      exec /usr/local/bin/telegram-bot-api \
+      --api-id="$$TELEGRAM_API_ID" \
+      --api-hash="$$TELEGRAM_API_HASH" \
+      --local \
+      --http-ip-address=0.0.0.0 \
+      --http-port=8081 \
+      --dir=/var/lib/telegram-bot-api \
+      --temp-dir=/var/lib/telegram-bot-api/temp
+    expose:
+      - "8081"
+    secrets:
+      - source: telegram_credentials
+        target: telegram
+    volumes:
+      - "${TELEGRAM_BOT_API_DATA_DIR:-./data/bot-api}:/var/lib/telegram-bot-api"
+    healthcheck:
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://localhost:8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    stop_grace_period: 30s
+
+  telegram-ingest:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    image: telegram-downloader/worker:1
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+    secrets:
+      - source: telegram_credentials
+        target: telegram
+    environment:
+      TELEGRAM_SECRETS_FILE: /run/secrets/telegram
+      TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
+      BOT_DATA_DIRECTORY: /var/lib/telegram-bot-api
+      QUEUE_DATABASE: /state/queue.sqlite3
+      PARTIAL_DIRECTORY: /media/Incoming/.partial
+      MOVIES_DIRECTORY: /media/Movies
+      FREE_SPACE_RESERVE_BYTES: "${FREE_SPACE_RESERVE_BYTES:-10737418240}"
+      MAX_ATTEMPTS: "${MAX_ATTEMPTS:-5}"
+      GET_FILE_RETRY_WINDOW_SECONDS: "${GET_FILE_RETRY_WINDOW_SECONDS:-1200}"
+      PROGRESS_INTERVAL_SECONDS: "${PROGRESS_INTERVAL_SECONDS:-20}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - "${TELEGRAM_BOT_API_DATA_DIR:-./data/bot-api}:/var/lib/telegram-bot-api:ro"
+      - "${TELEGRAM_STATE_DIR:-./data/state}:/state"
+      - "${MEDIA_LIBRARY_DIR:?Set MEDIA_LIBRARY_DIR in .env}:/media"
+    stop_grace_period: 30s
+
+secrets:
+  telegram_credentials:
+    file: "${TELEGRAM_SECRETS_FILE:-./telegram-secrets.env}"

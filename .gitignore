@@ -1,0 +1,7 @@
+.env
+telegram-secrets.env
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
