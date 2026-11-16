@@ -1,35 +1,151 @@
-name: telegram-downloader
+name: home-server
 
 services:
+  stremio:
+    # Stremio web player + streaming server. Host port 8090 avoids Ente's
+    # existing LAN API on 8080.
+    image: tsaridas/stremio-docker:latest
+    restart: unless-stopped
+    environment:
+      NO_CORS: "1"
+      AUTO_SERVER_URL: "1"
+      WEBUI_LOCATION: "http://192.168.1.7:8090"
+    ports:
+      - "192.168.1.7:8090:8080"
+    volumes:
+      - "/home/fredy/Home Server Data/Stremio:/root/.stremio-server"
+
+  museum:
+    image: ghcr.io/ente/server
+    restart: unless-stopped
+    ports:
+      - "192.168.1.7:8080:8080" # API (LAN only)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./ente-museum.yaml:/museum.yaml:ro
+      - ./data:/data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/ping"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  # Resolve "localhost:3200" in the museum container to the minio container.
+  socat:
+    image: alpine/socat
+    restart: unless-stopped
+    network_mode: service:museum
+    depends_on: [museum]
+    command: "TCP-LISTEN:3200,fork,reuseaddr TCP:minio:3200"
+
+  web:
+    image: ghcr.io/ente/web
+    restart: unless-stopped
+    ports:
+      - "192.168.1.7:3000:3000" # Photos
+      - "192.168.1.7:3001:3001" # Accounts
+      - "192.168.1.7:3002:3002" # Public albums
+      - "192.168.1.7:3003:3003" # Auth
+      - "192.168.1.7:3004:3004" # Cast
+      - "192.168.1.7:3005:3005" # Share / public Locker
+      - "192.168.1.7:3006:3006" # Embed
+      - "192.168.1.7:3008:3008" # Paste
+      - "192.168.1.7:3009:3009" # Locker
+      - "192.168.1.7:3010:3010" # Memories
+    # Set this to your custom museum URL, if any.
+    environment:
+      ENTE_API_ORIGIN: http://192.168.1.7:8080
+
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: REDACTED
+      POSTGRES_DB: ente_db
+    healthcheck:
+      test: pg_isready -q -d ente_db -U pguser
+      start_period: 40s
+      start_interval: 1s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    ports:
+      - "192.168.1.7:3200:3200" # MinIO API (LAN only)
+      # Uncomment to enable the MinIO web UI.
+      # - 3201:3201
+    environment:
+      MINIO_ROOT_USER: REDACTED
+      MINIO_ROOT_PASSWORD: REDACTED
+    command: server /data --address ":3200" --console-address ":3201"
+    volumes:
+      - minio-data:/data
+    post_start:
+      - command: |
+          sh -c '
+          while ! mc alias set h0 http://minio:3200 REDACTED REDACTED 2>/dev/null
+          do
+            echo "Waiting for minio..."
+            sleep 0.5
+          done
+
+          cd /data
+
+          mc mb -p b2-eu-cen
+          mc mb -p wasabi-eu-central-2-v3
+          mc mb -p scw-eu-fr-v3
+          '
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    restart: unless-stopped
+    user: "1000:1000"
+    init: true
+    ports:
+      - "192.168.1.7:8096:8096/tcp" # Jellyfin web and clients (LAN only)
+      - "192.168.1.7:7359:7359/udp" # LAN discovery
+    environment:
+      JELLYFIN_PublishedServerUrl: http://192.168.1.7:8096
+    volumes:
+      - "/home/fredy/Home Server Data/Jellyfin/config:/config"
+      - "/home/fredy/Home Server Data/Jellyfin/cache:/cache"
+      - "/home/fredy/Media Library:/media:ro"
+    stop_grace_period: 30s
+
   telegram-bot-api:
     build:
       context: .
       dockerfile: bot-api.Dockerfile
       args:
         TELEGRAM_BOT_API_COMMIT: e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1
-    image: telegram-downloader/bot-api:e3e9dd8
+    image: home-server/telegram-bot-api:e3e9dd8
     restart: unless-stopped
     user: "1000:1000"
     entrypoint: ["/bin/sh", "-ec"]
-    command: |
-      set -a
-      . /run/secrets/telegram
-      set +a
-      exec /usr/local/bin/telegram-bot-api \
-      --api-id="$$TELEGRAM_API_ID" \
-      --api-hash="$$TELEGRAM_API_HASH" \
-      --local \
-      --http-ip-address=0.0.0.0 \
-      --http-port=8081 \
-      --dir=/var/lib/telegram-bot-api \
-      --temp-dir=/var/lib/telegram-bot-api/temp
+    command:
+      - |
+        set -a
+        . /run/secrets/telegram
+        set +a
+        exec /usr/local/bin/telegram-bot-api \
+          --local \
+          --http-ip-address=0.0.0.0 \
+          --http-port=8081 \
+          --dir=/var/lib/telegram-bot-api \
+          --temp-dir=/var/lib/telegram-bot-api/temp
     expose:
       - "8081"
     secrets:
       - source: telegram_credentials
         target: telegram
     volumes:
-      - "${TELEGRAM_BOT_API_DATA_DIR:-./data/bot-api}:/var/lib/telegram-bot-api"
+      - "/home/fredy/Home Server Data/Telegram/bot-api:/var/lib/telegram-bot-api"
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://localhost:8081"]
       interval: 10s
@@ -42,7 +158,7 @@ services:
     build:
       context: .
       dockerfile: worker.Dockerfile
-    image: telegram-downloader/worker:1
+    image: home-server/telegram-ingest:1
     restart: unless-stopped
     user: "1000:1000"
     depends_on:
@@ -58,17 +174,57 @@ services:
       QUEUE_DATABASE: /state/queue.sqlite3
       PARTIAL_DIRECTORY: /media/Incoming/.partial
       MOVIES_DIRECTORY: /media/Movies
-      FREE_SPACE_RESERVE_BYTES: "${FREE_SPACE_RESERVE_BYTES:-10737418240}"
-      MAX_ATTEMPTS: "${MAX_ATTEMPTS:-5}"
-      GET_FILE_RETRY_WINDOW_SECONDS: "${GET_FILE_RETRY_WINDOW_SECONDS:-1200}"
-      PROGRESS_INTERVAL_SECONDS: "${PROGRESS_INTERVAL_SECONDS:-20}"
-      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      TV_DIRECTORY: /media/TV Shows
+      TORRENT_DROP_DIRECTORY: /media/Incoming/torrents
+      DOWNLOAD_DIRECTORY: /media/Incoming/torrent-downloads
+      QBITTORRENT_URL: http://qbittorrent:8080
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD:-REDACTED}
+      QBITTORRENT_SAVE_PATH: /downloads
+      QBITTORRENT_CATEGORY: tv
+      # Configured in .env; left empty here so the image carries no endpoint.
+      STREAM_SOURCE_URL: ${STREAM_SOURCE_URL:-}
+      STREAM_SOURCE_REFERER: ${STREAM_SOURCE_REFERER:-}
+      STREAM_SOURCE_USER_AGENT: ${STREAM_SOURCE_USER_AGENT:-}
+      DELETE_TORRENT_AFTER_ORGANISE: "true"
+      FREE_SPACE_RESERVE_BYTES: "10737418240"
+      MAX_ATTEMPTS: "5"
+      METADATA_TIMEOUT_SECONDS: "900"
+      GET_FILE_RETRY_WINDOW_SECONDS: "1200"
+      LOG_LEVEL: INFO
     volumes:
-      - "${TELEGRAM_BOT_API_DATA_DIR:-./data/bot-api}:/var/lib/telegram-bot-api:ro"
-      - "${TELEGRAM_STATE_DIR:-./data/state}:/state"
-      - "${MEDIA_LIBRARY_DIR:?Set MEDIA_LIBRARY_DIR in .env}:/media"
+      - "/home/fredy/Home Server Data/Telegram/bot-api:/var/lib/telegram-bot-api:ro"
+      - "/home/fredy/Home Server Data/Telegram/state:/state"
+      - "/home/fredy/Media Library:/media"
+      # Mounted so edits to the torrent source adapter take effect on restart,
+      # without rebuilding the image.
+      - "./torrent_source.py:/app/torrent_source.py:ro"
     stop_grace_period: 30s
+
+  qbittorrent:
+    # Torrent downloader for the Telegram series flow. Web UI is LAN-only on
+    # 8095 so it does not collide with Stremio (8090) or Ente's API (8080).
+    image: lscr.io/linuxserver/qbittorrent:latest
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Asia/Kolkata
+      WEBUI_PORT: "8080"
+      TORRENTING_PORT: "6881"
+    ports:
+      - "192.168.1.7:8095:8080" # Web UI (LAN only)
+      - "192.168.1.7:6881:6881" # Peer port (LAN only)
+      - "192.168.1.7:6881:6881/udp"
+    volumes:
+      - "/home/fredy/Home Server Data/qBittorrent:/config"
+      - "/home/fredy/Media Library/Incoming/torrent-downloads:/downloads"
+    stop_grace_period: 30s
+
+volumes:
+  postgres-data:
+  minio-data:
 
 secrets:
   telegram_credentials:
-    file: "${TELEGRAM_SECRETS_FILE:-./telegram-secrets.env}"
+    file: ./telegram-secrets.env
