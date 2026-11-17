@@ -964,8 +964,8 @@ class Worker:
         if qb_url:
             self.qb = QBittorrent(
                 qb_url,
-                os.environ.get("QBITTORRENT_USERNAME", "admin"),
-                os.environ.get("QBITTORRENT_PASSWORD", "REDACTED"),
+                os.environ.get("QBITTORRENT_USERNAME", ""),
+                os.environ.get("QBITTORRENT_PASSWORD", ""),
                 self.qb_save_path,
                 os.environ.get("QBITTORRENT_CATEGORY", "tv"),
             )
