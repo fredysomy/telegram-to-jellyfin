@@ -90,8 +90,8 @@ services:
       TORRENT_DROP_DIRECTORY: /media/Incoming/torrents
       DOWNLOAD_DIRECTORY: /media/Incoming/torrent-downloads
       QBITTORRENT_URL: http://qbittorrent:8080
-      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
-      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD:-REDACTED}
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:?set QBITTORRENT_USERNAME in .env}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD:?set QBITTORRENT_PASSWORD in .env}
       QBITTORRENT_SAVE_PATH: /downloads
       QBITTORRENT_CATEGORY: tv
       # Configured in .env; left empty here so the image carries no endpoint.
