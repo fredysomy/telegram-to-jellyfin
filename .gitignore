@@ -1,7 +1,9 @@
-.env
+# Live credentials and runtime data.
 telegram-secrets.env
-data/
+.env
+compose.yaml
+
+# Python artifacts.
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
+*.pyc
+state/

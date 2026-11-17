@@ -1,0 +1,78 @@
+# Home server inventory and endpoint registry.
+# Update this file first whenever an address, port, or service changes.
+version: 1
+
+host:
+  name: workstation
+  lan:
+    address: 192.168.1.7
+    network: 192.168.1.0/24
+    gateway: 192.168.1.1
+  tailscale:
+    address: 100.66.109.122
+    dns_name: workstation.tailcca058.ts.net
+
+paths:
+  setup_root: /home/fredy/Home Server Setup
+
+services:
+  ente:
+    status: running-healthy
+    compose_file: compose.yaml
+    application_config: ente-museum.yaml
+    endpoints:
+      photos: http://192.168.1.7:3000
+      accounts: http://192.168.1.7:3001
+      public_albums: http://192.168.1.7:3002
+      auth: http://192.168.1.7:3003
+      cast: http://192.168.1.7:3004
+      share: http://192.168.1.7:3005
+      embed: http://192.168.1.7:3006
+      paste: http://192.168.1.7:3008
+      locker: http://192.168.1.7:3009
+      memories: http://192.168.1.7:3010
+      api: http://192.168.1.7:8080
+      object_storage: http://192.168.1.7:3200
+    persistence:
+      database: docker-volume:postgres-data
+      object_storage: docker-volume:minio-data
+
+  jellyfin:
+    status: running-healthy-wizard-pending
+    compose_file: compose.yaml
+    endpoint: http://192.168.1.7:8096
+    discovery: 192.168.1.7:7359/udp
+    runtime_data: /home/fredy/Home Server Data/Jellyfin
+    libraries:
+      movies: /home/fredy/Media Library/Movies
+      tv_shows: /home/fredy/Media Library/TV Shows
+    ingestion:
+      staging: /home/fredy/Media Library/Incoming
+      partial: /home/fredy/Media Library/Incoming/.partial
+      rule: Download to partial, verify size, then atomically move into a library.
+
+  telegram_ingestion:
+    status: configured-not-started
+    compose_file: compose.yaml
+    bot_api_source_commit: e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1
+    network_exposure: internal-docker-network-only
+    state: /home/fredy/Home Server Data/Telegram/state
+    bot_api_data: /home/fredy/Home Server Data/Telegram/bot-api
+    destination: /home/fredy/Media Library/Movies
+    queue_concurrency: 1
+    free_space_reserve_bytes: 10737418240
+    pairing: first-private-channel-post
+
+reverse_proxy:
+  service: nginx
+  status: prepared-not-enabled
+  config_file: nginx.conf
+  dns_zone: ente.home.arpa
+
+media_import:
+  source_roots:
+    - /home/fredy/Documents
+    - /home/fredy/Google Photos
+    - /home/fredy/Pictures
+    - /home/fredy/Desktop
+  policy: Keep source files until import completeness and a separate restore test are verified.

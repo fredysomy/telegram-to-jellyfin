@@ -1,0 +1,9 @@
+# These files contain live service credentials.
+compose.yaml
+ente-museum.yaml
+telegram-secrets.env
+telegram/__pycache__/
+
+# Local backup artifacts.
+backups/
+*.bak
