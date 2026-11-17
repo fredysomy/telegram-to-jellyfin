@@ -16,27 +16,6 @@ paths:
   setup_root: /home/fredy/Home Server Setup
 
 services:
-  ente:
-    status: running-healthy
-    compose_file: compose.yaml
-    application_config: ente-museum.yaml
-    endpoints:
-      photos: http://192.168.1.7:3000
-      accounts: http://192.168.1.7:3001
-      public_albums: http://192.168.1.7:3002
-      auth: http://192.168.1.7:3003
-      cast: http://192.168.1.7:3004
-      share: http://192.168.1.7:3005
-      embed: http://192.168.1.7:3006
-      paste: http://192.168.1.7:3008
-      locker: http://192.168.1.7:3009
-      memories: http://192.168.1.7:3010
-      api: http://192.168.1.7:8080
-      object_storage: http://192.168.1.7:3200
-    persistence:
-      database: docker-volume:postgres-data
-      object_storage: docker-volume:minio-data
-
   jellyfin:
     status: running-healthy-wizard-pending
     compose_file: compose.yaml
@@ -61,18 +40,9 @@ services:
     destination: /home/fredy/Media Library/Movies
     queue_concurrency: 1
     free_space_reserve_bytes: 10737418240
-    pairing: first-private-channel-post
+    pairing: owner-private-chat
 
 reverse_proxy:
   service: nginx
   status: prepared-not-enabled
   config_file: nginx.conf
-  dns_zone: ente.home.arpa
-
-media_import:
-  source_roots:
-    - /home/fredy/Documents
-    - /home/fredy/Google Photos
-    - /home/fredy/Pictures
-    - /home/fredy/Desktop
-  policy: Keep source files until import completeness and a separate restore test are verified.
