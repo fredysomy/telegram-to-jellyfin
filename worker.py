@@ -214,6 +214,13 @@ class Database:
                 UPDATE jobs SET status='queued' WHERE status='downloading';
                 """
             )
+            # Older databases predate the in-chat progress message.
+            try:
+                self.connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN status_message_id INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     # -- key/value -------------------------------------------------------
     def get_meta(self, key: str, default: str = "") -> str:
@@ -230,7 +237,8 @@ class Database:
             )
 
     # -- channel media jobs ----------------------------------------------
-    def enqueue(self, values: tuple[Any, ...]) -> bool:
+    def enqueue(self, values: tuple[Any, ...]) -> int | None:
+        """Insert a media job and return its id (None when it is a duplicate)."""
         with self.lock, self.connection:
             cursor = self.connection.execute(
                 """
@@ -241,7 +249,13 @@ class Database:
                 """,
                 values,
             )
-        return cursor.rowcount == 1
+        return int(cursor.lastrowid) if cursor.rowcount == 1 else None
+
+    def set_job_status_message(self, job_id: int, message_id: int) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "UPDATE jobs SET status_message_id=? WHERE id=?", (message_id, job_id)
+            )
 
     def completed(self, file_unique_id: str) -> sqlite3.Row | None:
         with self.lock:
@@ -426,7 +440,12 @@ def sanitize_name(file_name: str, caption: str) -> str:
     extension = Path(original).suffix.lower()
     base = caption.strip().splitlines()[0] if caption.strip() and not caption.lstrip().startswith("/") else Path(original).stem
     base = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", " ", base)
-    base = re.sub(r"\s+", " ", base).strip(" .")[:180]
+    base = re.sub(r"\s+", " ", base).strip(" .")
+    # Captions usually repeat the filename, so the extension is already there;
+    # appending it again produced "Movie.mkv.mkv".
+    if extension and base.lower().endswith(extension):
+        base = base[: -len(extension)].rstrip(" .")
+    base = base[:180]
     if not base:
         base = f"telegram-{uuid.uuid4().hex[:12]}"
     return f"{base}{extension}"
@@ -505,6 +524,12 @@ def human_speed(value: float) -> str:
     if value <= 0:
         return "0 B/s"
     return f"{human_size(int(value))}/s"
+
+
+def progress_bar(fraction: float, width: int = 12) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(round(fraction * width))
+    return "▓" * filled + "░" * (width - filled)
 
 
 def human_eta(seconds: int) -> str:
@@ -1115,7 +1140,7 @@ class Worker:
             self.api.delete(chat_id, int(post["message_id"]))
             return
 
-        inserted = self.database.enqueue(
+        job_id = self.database.enqueue(
             (
                 int(update["update_id"]), chat_id, int(post["message_id"]),
                 str(post.get("media_group_id") or ""), file_id, unique_id, file_name,
@@ -1123,8 +1148,12 @@ class Worker:
                 str(post.get("caption") or ""), int(time.time()),
             )
         )
-        if inserted:
-            self.api.send(chat_id, f"📥 Queued: {Path(file_name).name}")
+        if job_id:
+            note = self.api.send(chat_id, f"📥 Queued: {Path(file_name).name}")
+            try:
+                self.database.set_job_status_message(job_id, int(note.get("message_id") or 0))
+            except Exception:  # noqa: BLE001
+                LOG.debug("Could not remember the queued message id", exc_info=True)
 
     # -- command handling ------------------------------------------------
     def handle_message(self, update: dict[str, Any]) -> None:
@@ -2045,7 +2074,73 @@ class Worker:
                     except Exception:  # noqa: BLE001
                         LOG.exception("Could not send terminal failure notification")
 
+    def telegram_download_bytes(self, since: float) -> int:
+        """Bytes the local Bot API has written for the current getFile call.
+
+        The API downloads into ``<token>/temp/<id>`` and moves the finished file
+        to ``<token>/videos|documents/file_<id>.<ext>``. Only files touched
+        after ``since`` are considered, so an old cache entry cannot be mistaken
+        for the current transfer.
+        """
+        best = 0
+        try:
+            candidates = list(self.bot_data_dir.glob("*/temp/*"))
+        except OSError:
+            return 0
+        for path in candidates:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < since:
+                continue
+            best = max(best, stat.st_size)
+        return best
+
+    def watch_telegram_download(
+        self,
+        chat_id: int,
+        message_id: int,
+        display: str,
+        expected: int,
+        started: float,
+        stop: threading.Event,
+    ) -> None:
+        """Edit one message with live progress while getFile is running."""
+        last_size = 0
+        speed = 0.0
+        last_time = time.monotonic()
+        last_edit = 0.0
+        while not stop.wait(3):
+            size = self.telegram_download_bytes(started)
+            now = time.monotonic()
+            if size > last_size:
+                speed = (size - last_size) / max(0.001, now - last_time)
+                last_size = size
+                last_time = now
+            if now - last_edit < 12:
+                continue
+            last_edit = now
+            if not last_size:
+                text = f"⬇️ Downloading: {display}\nPreparing…"
+            else:
+                total = expected or last_size
+                fraction = min(1.0, last_size / total) if total else 0.0
+                eta = int((total - last_size) / speed) if speed > 0 else 0
+                text = (
+                    f"⬇️ Downloading: {display}\n"
+                    f"{progress_bar(fraction)} {fraction * 100:.1f}%\n"
+                    f"{human_size(last_size)} / {human_size(total)} · "
+                    f"{human_speed(speed)} · ETA {human_eta(eta)}"
+                )
+            try:
+                self.api.edit(chat_id, message_id, text)
+            except Exception:  # noqa: BLE001
+                LOG.debug("Could not update download progress", exc_info=True)
+
     def process_job(self, job: sqlite3.Row) -> None:
+        chat_id = int(job["chat_id"])
+        display = Path(str(job["file_name"])).name
         expected_size = int(job["file_size"])
         free = shutil.disk_usage(self.movies_dir).free
         if expected_size and free < expected_size + self.reserve_bytes:
@@ -2054,54 +2149,106 @@ class Worker:
                 f"keeping {human_size(self.reserve_bytes)} reserved"
             )
 
-        deadline = time.monotonic() + self.get_file_retry_window
-        while True:
-            remaining = max(1, int(deadline - time.monotonic()))
+        # Reuse the "📥 Queued" message so one bubble walks through
+        # queued → downloading (with a live bar) → verifying → done.
+        progress_id = int(job["status_message_id"] or 0) if "status_message_id" in job.keys() else 0
+        started_text = f"⬇️ Downloading: {display}\nPreparing…"
+        if progress_id:
             try:
-                file_info = self.api.call(
-                    "getFile", {"file_id": job["file_id"]}, timeout=remaining
-                )
-                break
-            except (ConnectionResetError, TimeoutError, http.client.RemoteDisconnected) as error:
-                if deadline - time.monotonic() <= 0:
-                    raise RuntimeError(
-                        f"Telegram getFile did not complete within "
-                        f"{self.get_file_retry_window // 60} minutes: {error}"
-                    ) from error
-                LOG.warning("Telegram getFile connection dropped; retrying: %s", error)
-                STOP.wait(min(5, deadline - time.monotonic()))
-        file_path = str(file_info.get("file_path") or "")
-        if not file_path:
-            raise RuntimeError("Telegram getFile did not return a file path")
-        source = Path(file_path)
-        if not source.is_absolute():
-            source = self.bot_data_dir / source
-        if not source.is_file():
-            raise RuntimeError(f"Downloaded Telegram file is unavailable at {source}")
-
-        final_name = sanitize_name(str(job["file_name"]), str(job["caption"] or ""))
-        destination, already_present = choose_destination(self.movies_dir, final_name, expected_size)
-        if already_present:
-            size = destination.stat().st_size
-            digest = "existing-file-size-match"
-        else:
-            partial = self.partial_dir / f"{uuid.uuid4().hex}.part"
+                self.api.edit(chat_id, progress_id, started_text)
+            except Exception:  # noqa: BLE001
+                progress_id = 0
+        if not progress_id:
             try:
-                size, digest = copy_and_hash(source, partial)
-                if expected_size and size != expected_size:
-                    raise RuntimeError(f"Size mismatch: expected {expected_size}, received {size}")
-                verify_media(partial)
-                os.replace(partial, destination)
-            finally:
-                partial.unlink(missing_ok=True)
+                progress = self.api.send(chat_id, started_text)
+                progress_id = int(progress.get("message_id") or 0)
+            except Exception:  # noqa: BLE001
+                LOG.debug("Could not announce download start", exc_info=True)
+        started = time.time() - 5
+        stop = threading.Event()
+        if progress_id:
+            threading.Thread(
+                target=self.watch_telegram_download,
+                args=(chat_id, progress_id, display, expected_size, started, stop),
+                name="media-progress",
+                daemon=True,
+            ).start()
 
-        self.database.finish(
-            int(job["id"]), str(job["file_unique_id"]), destination, size, digest
-        )
-        self.api.send(
-            int(job["chat_id"]),
-            f"✅ Downloaded: {destination.name}\nSize: {human_size(size)}\nJellyfin folder: Movies",
-        )
+        try:
+            deadline = time.monotonic() + self.get_file_retry_window
+            while True:
+                remaining = max(1, int(deadline - time.monotonic()))
+                try:
+                    file_info = self.api.call(
+                        "getFile", {"file_id": job["file_id"]}, timeout=remaining
+                    )
+                    break
+                except (ConnectionResetError, TimeoutError, http.client.RemoteDisconnected) as error:
+                    if deadline - time.monotonic() <= 0:
+                        raise RuntimeError(
+                            f"Telegram getFile did not complete within "
+                            f"{self.get_file_retry_window // 60} minutes: {error}"
+                        ) from error
+                    LOG.warning("Telegram getFile connection dropped; retrying: %s", error)
+                    STOP.wait(min(5, deadline - time.monotonic()))
+            file_path = str(file_info.get("file_path") or "")
+            if not file_path:
+                raise RuntimeError("Telegram getFile did not return a file path")
+            source = Path(file_path)
+            if not source.is_absolute():
+                source = self.bot_data_dir / source
+            if not source.is_file():
+                raise RuntimeError(f"Downloaded Telegram file is unavailable at {source}")
+            stop.set()
+            if progress_id:
+                try:
+                    self.api.edit(
+                        chat_id, progress_id,
+                        f"🔄 Verifying: {display}\nFiling into Movies…",
+                    )
+                except Exception:  # noqa: BLE001
+                    LOG.debug("Could not update progress to verifying", exc_info=True)
+
+            final_name = sanitize_name(str(job["file_name"]), str(job["caption"] or ""))
+            destination, already_present = choose_destination(self.movies_dir, final_name, expected_size)
+            if already_present:
+                size = destination.stat().st_size
+                digest = "existing-file-size-match"
+            else:
+                partial = self.partial_dir / f"{uuid.uuid4().hex}.part"
+                try:
+                    size, digest = copy_and_hash(source, partial)
+                    if expected_size and size != expected_size:
+                        raise RuntimeError(f"Size mismatch: expected {expected_size}, received {size}")
+                    verify_media(partial)
+                    os.replace(partial, destination)
+                finally:
+                    partial.unlink(missing_ok=True)
+
+            self.database.finish(
+                int(job["id"]), str(job["file_unique_id"]), destination, size, digest
+            )
+            done = f"✅ Downloaded: {destination.name}\nSize: {human_size(size)}\nJellyfin folder: Movies"
+            if progress_id:
+                try:
+                    self.api.edit(chat_id, progress_id, done)
+                except Exception:  # noqa: BLE001
+                    self.api.send(chat_id, done)
+            else:
+                self.api.send(chat_id, done)
+        except Exception as error:
+            stop.set()
+            if progress_id:
+                try:
+                    self.api.edit(
+                        chat_id, progress_id,
+                        f"❌ Download failed: {display}\n{str(error)[:400]}",
+                    )
+                except Exception:  # noqa: BLE001
+                    LOG.debug("Could not report download failure", exc_info=True)
+            raise
+        finally:
+            stop.set()
         try:
             self.api.delete(int(job["chat_id"]), int(job["message_id"]))
         except Exception as error:  # noqa: BLE001
